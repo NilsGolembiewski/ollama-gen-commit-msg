@@ -114,6 +114,62 @@ def _untracked_diff(relative_path: str, root: Path) -> str:
     raise GitCommandError(message)
 
 
+def recent_commits(cwd: str | Path | None = None, *, limit: int = 20) -> str:
+    """Return the most recent commit messages (newest first).
+
+    Returns an empty string for unborn branches and on any Git failure, so the
+    prompt is enriched only when history actually exists.
+    """
+    if limit <= 0:
+        return ""
+    root = _repository_root(Path(cwd) if cwd is not None else Path.cwd())
+    result = _invoke_git(
+        ("log", f"-n{limit}", "--no-decorate", "--format=%s"),
+        root,
+    )
+    if result.returncode != 0:
+        # Unborn branch (`HEAD` has no commits yet) or a corrupt reflog: no
+        # history to mirror, so degrade to an empty section.
+        return ""
+    return _decode_output(result.stdout, "Git log output").strip("\n")
+
+
+def branch_name(cwd: str | Path | None = None) -> str:
+    """Return the current branch name, or an empty string if it cannot be determined.
+
+    `git rev-parse --abbrev-ref HEAD` prints `HEAD` and exits nonzero on an
+    unborn branch; both cases collapse to an empty string here.
+    """
+    root = _repository_root(Path(cwd) if cwd is not None else Path.cwd())
+    result = _invoke_git(("rev-parse", "--abbrev-ref", "HEAD"), root)
+    if result.returncode != 0:
+        return ""
+    name = _decode_output(result.stdout, "Git branch name").strip()
+    if not name or name == "HEAD":
+        return ""
+    return name
+
+
+def branch_commits(
+    base: str = "main", cwd: str | Path | None = None
+) -> str:
+    """Return commit subjects on the current branch not reachable from `base`.
+
+    Returns an empty string when `base` does not exist (for example a fresh
+    repository without a `main` branch) or on any other Git failure, so the
+    prompt is enriched only when a real base is available.
+    """
+    root = _repository_root(Path(cwd) if cwd is not None else Path.cwd())
+    result = _invoke_git(
+        ("log", "--no-decorate", "--format=%s", f"{base}..HEAD"),
+        root,
+    )
+    if result.returncode != 0:
+        # Missing base ref or unborn HEAD: no thread to anchor to.
+        return ""
+    return _decode_output(result.stdout, "Git branch log output").strip("\n")
+
+
 def collect_changes(cwd: str | Path | None = None) -> str:
     root = _repository_root(Path(cwd) if cwd is not None else Path.cwd())
     staged = _diff(

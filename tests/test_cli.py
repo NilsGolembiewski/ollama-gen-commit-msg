@@ -7,7 +7,11 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, patch
 
 from gen_commit_msg.cli import main
-from gen_commit_msg.generator import GenerationError, generate_message as generate
+from gen_commit_msg.generator import (
+    CommitContext,
+    GenerationError,
+    generate_message as generate,
+)
 from gen_commit_msg.git_changes import (
     GitCommandError,
     GitRepositoryError,
@@ -17,10 +21,18 @@ from gen_commit_msg.git_changes import (
 
 class CliTests(unittest.TestCase):
     @patch.dict(os.environ, {"OLLAMA_HOST": "http://localhost:11434"}, clear=True)
+    @patch("gen_commit_msg.cli.recent_commits", return_value="feat: prior change")
+    @patch("gen_commit_msg.cli.branch_name", return_value="feature/123")
+    @patch("gen_commit_msg.cli.branch_commits", return_value="wip: in progress")
     @patch("gen_commit_msg.cli.generate_message", return_value="Add staged change")
     @patch("gen_commit_msg.cli.collect_changes", return_value="literal diff\n")
     def test_success_prints_only_generated_message(
-        self, collect_changes, generate_message
+        self,
+        collect_changes,
+        generate_message,
+        branch_commits,
+        branch_name,
+        recent_commits,
     ) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -33,8 +45,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         collect_changes.assert_called_once()
         generate_message.assert_called_once_with(
-            "literal diff\n", "http://localhost:11434"
+            "literal diff\n",
+            "http://localhost:11434",
+            context=CommitContext(
+                recent_commits="feat: prior change",
+                branch_name="feature/123",
+                branch_commits="wip: in progress",
+            ),
         )
+        recent_commits.assert_called_once_with(limit=20)
+        branch_name.assert_called_once()
+        branch_commits.assert_called_once_with("main")
 
     @patch("gen_commit_msg.cli.collect_changes")
     @patch("gen_commit_msg.cli.generate_message")
@@ -162,10 +183,11 @@ class CliTests(unittest.TestCase):
         client = Mock()
         client.generate.return_value = Mock(response=None)
 
-        def generate_missing_response(changes: str, host: str) -> str:
+        def generate_missing_response(changes: str, host: str, context=None) -> str:
             return generate(
                 changes,
                 host,
+                context=context,
                 client_factory=Mock(return_value=client),
             )
 

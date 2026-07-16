@@ -11,7 +11,10 @@ from gen_commit_msg.git_changes import (
     GitOutputError,
     GitRepositoryError,
     NoChangesError,
+    branch_commits,
+    branch_name,
     collect_changes,
+    recent_commits,
 )
 
 
@@ -203,6 +206,92 @@ class GitChangeCollectionTests(unittest.TestCase):
             self.assertEqual(result.stderr, b"")
             chunks.append(result.stdout.decode("utf-8"))
         return "".join(chunks)
+
+
+class CommitHistoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repository = GitRepository()
+
+    def tearDown(self) -> None:
+        self.repository.close()
+
+    def _commit(self, subject: str, files: dict[str, str]) -> None:
+        for relative_path, content in files.items():
+            self.repository.write(relative_path, content)
+        self.repository.run("add", "--all")
+        self.repository.run("commit", "--quiet", "-m", subject)
+
+    def test_recent_commits_returns_subjects_newest_first(self) -> None:
+        self._commit("feat: initial", {"a.txt": "1\n"})
+        self._commit("fix: leak", {"a.txt": "2\n"})
+        self._commit("docs: readme", {"README.md": "x\n"})
+
+        result = recent_commits(self.repository.path, limit=20)
+
+        self.assertEqual(
+            result,
+            "docs: readme\nfix: leak\nfeat: initial",
+        )
+
+    def test_recent_commits_respects_limit(self) -> None:
+        for index in range(5):
+            self._commit(f"feat: {index}", {"a.txt": f"{index}\n"})
+
+        result = recent_commits(self.repository.path, limit=3)
+
+        self.assertEqual(result, "feat: 4\nfeat: 3\nfeat: 2")
+
+    def test_recent_commits_zero_limit_returns_empty(self) -> None:
+        self._commit("feat: only", {"a.txt": "1\n"})
+
+        self.assertEqual(recent_commits(self.repository.path, limit=0), "")
+
+    def test_recent_commits_unborn_branch_returns_empty(self) -> None:
+        self.repository.write("a.txt", "1\n")
+
+        self.assertEqual(recent_commits(self.repository.path), "")
+
+    def test_branch_name_returns_current_branch(self) -> None:
+        self._commit("feat: initial", {"a.txt": "1\n"})
+        self.repository.run("checkout", "--quiet", "-b", "feature/123-ss0")
+
+        self.assertEqual(
+            branch_name(self.repository.path), "feature/123-ss0"
+        )
+
+    def test_branch_name_unborn_branch_returns_empty(self) -> None:
+        self.repository.write("a.txt", "1\n")
+
+        self.assertEqual(branch_name(self.repository.path), "")
+
+    def test_branch_name_detached_head_returns_empty(self) -> None:
+        self._commit("feat: initial", {"a.txt": "1\n"})
+        self.repository.run("checkout", "--quiet", "--detach", "HEAD")
+
+        self.assertEqual(branch_name(self.repository.path), "")
+
+    def test_branch_commits_returns_subjects_since_base(self) -> None:
+        self._commit("feat: initial", {"a.txt": "1\n"})
+        self.repository.run("branch", "-m", "main")
+        self.repository.run("checkout", "--quiet", "-b", "feature/456")
+        self._commit("wip: scaffold", {"a.txt": "2\n"})
+        self._commit("wip: wire", {"a.txt": "3\n"})
+
+        result = branch_commits("main", self.repository.path)
+
+        self.assertEqual(result, "wip: wire\nwip: scaffold")
+
+    def test_branch_commits_missing_base_returns_empty(self) -> None:
+        self._commit("feat: initial", {"a.txt": "1\n"})
+
+        result = branch_commits("main", self.repository.path)
+
+        self.assertEqual(result, "")
+
+    def test_branch_commits_unborn_head_returns_empty(self) -> None:
+        self.repository.write("a.txt", "1\n")
+
+        self.assertEqual(branch_commits("main", self.repository.path), "")
 
 
 if __name__ == "__main__":

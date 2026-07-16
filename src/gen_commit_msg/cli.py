@@ -6,8 +6,20 @@ import sys
 from collections.abc import Sequence
 from urllib.parse import urlparse
 
-from gen_commit_msg.generator import GenerationError, generate_message
-from gen_commit_msg.git_changes import GitChangesError, collect_changes
+from gen_commit_msg.generator import (
+    BRANCH_BASE,
+    RECENT_LIMIT,
+    CommitContext,
+    GenerationError,
+    generate_message,
+)
+from gen_commit_msg.git_changes import (
+    GitChangesError,
+    branch_commits,
+    branch_name,
+    collect_changes,
+    recent_commits,
+)
 
 
 class ConfigurationError(Exception):
@@ -44,7 +56,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         host = _configured_host()
         changes = collect_changes()
-        message = generate_message(changes, host)
+        context = CommitContext(
+            recent_commits=recent_commits(limit=RECENT_LIMIT),
+            branch_name=branch_name(),
+            branch_commits=branch_commits(BRANCH_BASE),
+        )
+        message = generate_message(changes, host, context=context)
     except (ConfigurationError, GitChangesError, GenerationError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
