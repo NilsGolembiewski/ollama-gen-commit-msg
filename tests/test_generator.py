@@ -94,7 +94,7 @@ class GenerationTests(unittest.TestCase):
 
         client_factory.assert_called_once_with(host="http://localhost:11434")
         client.generate.assert_called_once_with(
-            model="glm-5.2:cloud",
+            model="glm-5.3-flash:cloud",
             prompt=build_prompt(changes),
             stream=False,
         )
@@ -119,7 +119,7 @@ class GenerationTests(unittest.TestCase):
         )
 
         client.generate.assert_called_once_with(
-            model="glm-5.2:cloud",
+            model="glm-5.3-flash:cloud",
             prompt=build_prompt(changes, context),
             stream=False,
         )

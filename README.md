@@ -1,7 +1,7 @@
 # gen-commit-msg
 
 Generate a concise commit message from the current Git changes with Ollama Cloud's
-`glm-5.2:cloud` model.
+`glm-5.3-flash:cloud` model.
 
 The command prints a commit-message suggestion. It does not stage files, create a
 commit, or modify the repository.
@@ -17,7 +17,7 @@ Sign the local Ollama installation in and make the cloud model available:
 
 ```bash
 ollama signin
-ollama pull glm-5.2:cloud
+ollama pull glm-5.3-flash:cloud
 ```
 
 ## Install
@@ -35,7 +35,7 @@ export OLLAMA_HOST=http://localhost:11434
 ```
 
 The direct cloud API host `https://ollama.com` is intentionally rejected. This
-tool uses the `glm-5.2:cloud` model through a signed-in local Ollama server and
+tool uses the `glm-5.3-flash:cloud` model through a signed-in local Ollama server and
 does not implement direct `OLLAMA_API_KEY` mode.
 
 ## Usage

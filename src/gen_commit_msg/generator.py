@@ -8,7 +8,7 @@ import httpx
 from ollama import Client, ResponseError
 
 
-MODEL = "glm-5.2:cloud"
+MODEL = "glm-5.3-flash:cloud"
 INSTRUCTION = (
     "Create a concise commit message that accurately summarizes these changes. "
     "Return only the commit message."
@@ -72,7 +72,7 @@ def generate_message(
         )
     except ResponseError as error:
         raise GenerationError(
-            "Ollama rejected the generation request. Ensure glm-5.2:cloud is "
+            "Ollama rejected the generation request. Ensure glm-5.3-flash:cloud is "
             "available and the local Ollama server is signed in."
         ) from error
     except (ConnectionError, httpx.HTTPError, httpx.InvalidURL, ValueError) as error:
