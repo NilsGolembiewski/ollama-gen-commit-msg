@@ -208,6 +208,290 @@ class GitChangeCollectionTests(unittest.TestCase):
         return "".join(chunks)
 
 
+class DiffCompactionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repository = GitRepository()
+
+    def tearDown(self) -> None:
+        self.repository.close()
+
+    def _cached_diff(self, *paths: str) -> str:
+        return self.repository.run(
+            "diff", "--cached", "--no-color", "--no-ext-diff", "--", *paths
+        ).stdout.decode("utf-8")
+
+    def _cached_numstat(self, relative_path: str) -> tuple[int, int]:
+        output = self.repository.run(
+            "diff",
+            "--cached",
+            "--numstat",
+            "--no-color",
+            "--no-ext-diff",
+            "--",
+            relative_path,
+        ).stdout.decode("utf-8").strip()
+        insertions, deletions, _path = output.split("\t", 2)
+        return int(insertions), int(deletions)
+
+    def _untracked_numstat(self, relative_path: str) -> tuple[int, int]:
+        result = self.repository.run_unchecked(
+            "diff",
+            "--no-index",
+            "--numstat",
+            "--no-color",
+            "--no-ext-diff",
+            "--",
+            "/dev/null",
+            relative_path,
+        )
+        output = result.stdout.decode("utf-8").strip()
+        insertions, deletions, _path = output.split("\t", 2)
+        return int(insertions), int(deletions)
+
+    def test_staged_lockfile_is_omitted_next_to_source_patch(self) -> None:
+        lock_before = "version = 1\n" + "".join(f"pkg-{i}\n" for i in range(10))
+        lock_after = "version = 1\n" + "".join(f"pkg-{i}\n" for i in range(40))
+        self.repository.commit_baseline(
+            {"src/app.py": "print('before')\n", "uv.lock": lock_before}
+        )
+        self.repository.write("src/app.py", "print('after')\n")
+        self.repository.write("uv.lock", lock_after)
+        self.repository.run("add", "src/app.py", "uv.lock")
+
+        insertions, deletions = self._cached_numstat("uv.lock")
+        source_patch = self._cached_diff("src/app.py")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertEqual(
+            actual,
+            source_patch
+            + f"omitted lockfile: uv.lock (modified, +{insertions} -{deletions})\n",
+        )
+        self.assertNotIn("pkg-39", actual)
+
+    def test_added_and_deleted_lockfiles_are_omitted_with_kind(self) -> None:
+        self.repository.commit_baseline({"yarn.lock": "old-lock\nline-2\n"})
+        self.repository.write("package-lock.json", "new-lock\nline-2\nline-3\n")
+        self.repository.run("rm", "yarn.lock")
+        self.repository.run("add", "package-lock.json")
+
+        added_ins, added_del = self._cached_numstat("package-lock.json")
+        deleted_ins, deleted_del = self._cached_numstat("yarn.lock")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertEqual(
+            actual,
+            f"omitted lockfile: package-lock.json (added, +{added_ins} -{added_del})\n"
+            f"omitted lockfile: yarn.lock (deleted, +{deleted_ins} -{deleted_del})\n",
+        )
+        self.assertNotIn("new-lock", actual)
+        self.assertNotIn("old-lock", actual)
+
+    def test_untracked_nested_lockfile_is_omitted_without_mutating_status(self) -> None:
+        self.repository.commit_baseline({"tracked.txt": "unchanged\n"})
+        self.repository.write(
+            "frontend/pnpm-lock.yaml",
+            "lockfileVersion: 9\n" + "".join(f"dep-{i}: 1.0.{i}\n" for i in range(20)),
+        )
+        status_before = self.repository.run("status", "--porcelain=v1", "-z").stdout
+        insertions, deletions = self._untracked_numstat("frontend/pnpm-lock.yaml")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertEqual(
+            actual,
+            "omitted lockfile: frontend/pnpm-lock.yaml "
+            f"(added, +{insertions} -{deletions})\n",
+        )
+        self.assertNotIn("dep-19", actual)
+        self.assertEqual(
+            self.repository.run("status", "--porcelain=v1", "-z").stdout,
+            status_before,
+        )
+
+    def test_lockfile_only_change_is_still_a_change(self) -> None:
+        self.repository.commit_baseline({"Cargo.lock": "version = 3\nname = \"a\"\n"})
+        self.repository.write("Cargo.lock", "version = 3\nname = \"b\"\n")
+        self.repository.run("add", "Cargo.lock")
+        insertions, deletions = self._cached_numstat("Cargo.lock")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertEqual(
+            actual,
+            f"omitted lockfile: Cargo.lock (modified, +{insertions} -{deletions})\n",
+        )
+        self.assertNotIn('name = "b"', actual)
+
+    def test_lock_suffix_omits_app_lock_but_not_notes_lock_md(self) -> None:
+        self.repository.commit_baseline(
+            {
+                "vendor/app.lock": "held\n",
+                "notes.lock.md": "notes before\n",
+            }
+        )
+        self.repository.write("vendor/app.lock", "held\nreleased\n")
+        self.repository.write("notes.lock.md", "notes after\n")
+        self.repository.run("add", "vendor/app.lock", "notes.lock.md")
+
+        notes_patch = self._cached_diff("notes.lock.md")
+        insertions, deletions = self._cached_numstat("vendor/app.lock")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertEqual(
+            actual,
+            notes_patch
+            + f"omitted lockfile: vendor/app.lock (modified, +{insertions} -{deletions})\n",
+        )
+        self.assertIn("notes after", actual)
+        self.assertNotIn("released", actual)
+
+    def test_go_sum_is_omitted_as_named_lockfile(self) -> None:
+        self.repository.commit_baseline({"go.sum": "mod@v1 h1:aaa\n"})
+        self.repository.write("go.sum", "mod@v1 h1:bbb\n")
+        self.repository.run("add", "go.sum")
+        insertions, deletions = self._cached_numstat("go.sum")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertEqual(
+            actual,
+            f"omitted lockfile: go.sum (modified, +{insertions} -{deletions})\n",
+        )
+        self.assertNotIn("h1:bbb", actual)
+
+    def test_spaced_source_path_stays_literal_next_to_lockfile(self) -> None:
+        self.repository.commit_baseline(
+            {"my file.txt": "before\n", "uv.lock": "version = 1\n"}
+        )
+        self.repository.write("my file.txt", "after\n")
+        self.repository.write("uv.lock", "version = 2\n")
+        self.repository.run("add", "my file.txt", "uv.lock")
+
+        source_patch = self._cached_diff("my file.txt")
+        insertions, deletions = self._cached_numstat("uv.lock")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertEqual(
+            actual,
+            source_patch
+            + f"omitted lockfile: uv.lock (modified, +{insertions} -{deletions})\n",
+        )
+        self.assertIn("after", actual)
+
+    def test_oversized_file_patch_is_truncated_with_remainder_counts(self) -> None:
+        lines = [f"line-{index:04d}\n" for index in range(400)]
+        self.repository.write("big.txt", "".join(lines))
+        self.repository.run("add", "big.txt")
+        original = self._cached_diff("big.txt")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertTrue(actual.startswith("diff --git a/big.txt b/big.txt\n"))
+        self.assertIn("omitted remainder: big.txt (", actual)
+        self.assertNotIn("line-0399", actual)
+        prefix, trailer = actual.split("omitted remainder: big.txt ", 1)
+        self.assertTrue(original.startswith(prefix))
+        self.assertLess(len(prefix), len(original))
+        dropped = original[len(prefix) :]
+        self.assertIn(f"({dropped.count(chr(10))} lines, {len(dropped.encode('utf-8'))} bytes)", trailer)
+        prefix_lines = prefix.splitlines(keepends=True)
+        self.assertLessEqual(len(prefix_lines), 300)
+        self.assertLessEqual(len(prefix.encode("utf-8")), 16384)
+        next_line = dropped.splitlines(keepends=True)[0]
+        self.assertTrue(
+            len(prefix_lines) + 1 > 300
+            or len(prefix.encode("utf-8")) + len(next_line.encode("utf-8")) > 16384
+        )
+
+    def test_patch_just_under_per_file_limits_stays_literal(self) -> None:
+        self.repository.write(
+            "medium.txt", "".join(f"row-{index:03d}\n" for index in range(200))
+        )
+        self.repository.run("add", "medium.txt")
+        expected = self._cached_diff("medium.txt")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertEqual(actual, expected)
+        self.assertNotIn("omitted remainder:", actual)
+
+    def test_total_budget_demotes_largest_full_patches(self) -> None:
+        payload = ("x" * 100 + "\n") * 140
+        for name in ("a.txt", "b.txt", "c.txt"):
+            self.repository.write(name, payload)
+        self.repository.run("add", "a.txt", "b.txt", "c.txt")
+        originals = {name: self._cached_diff(name) for name in ("a.txt", "b.txt", "c.txt")}
+        for original in originals.values():
+            self.assertLessEqual(len(original.splitlines()), 300)
+            self.assertLessEqual(len(original.encode("utf-8")), 16384)
+        self.assertGreater(sum(len(text) for text in originals.values()), 32768)
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertLessEqual(len(actual), 32768)
+        self.assertIn("omitted large diff:", actual)
+        for name in ("a.txt", "b.txt", "c.txt"):
+            self.assertTrue(
+                name in actual,
+                f"{name} must still be listed",
+            )
+            if f"omitted large diff: {name} " in actual:
+                insertions, deletions = self._cached_numstat(name)
+                self.assertIn(
+                    f"omitted large diff: {name} (added, +{insertions} -{deletions})\n",
+                    actual,
+                )
+            else:
+                self.assertIn(originals[name], actual)
+
+    def test_mixed_source_generated_and_lockfile_are_compacted_together(self) -> None:
+        self.repository.commit_baseline(
+            {
+                "src/app.py": "print('before')\n",
+                "uv.lock": "version = 1\n",
+            }
+        )
+        self.repository.write("src/app.py", "print('after')\n")
+        self.repository.write("uv.lock", "version = 2\n" + "".join(f"pkg-{i}\n" for i in range(30)))
+        self.repository.write(
+            "data.json", "".join(f'{{"i": {index}, "pad": "{"y" * 40}"}}\n' for index in range(400))
+        )
+        self.repository.run("add", "src/app.py", "uv.lock", "data.json")
+        source_patch = self._cached_diff("src/app.py")
+        lock_ins, lock_del = self._cached_numstat("uv.lock")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertIn(source_patch, actual)
+        self.assertIn(
+            f"omitted lockfile: uv.lock (modified, +{lock_ins} -{lock_del})\n",
+            actual,
+        )
+        self.assertNotIn("pkg-29", actual)
+        self.assertNotIn('"i": 399', actual)
+        self.assertTrue(
+            "omitted remainder: data.json " in actual
+            or "omitted large diff: data.json " in actual
+        )
+
+    def test_untracked_oversized_file_is_truncated(self) -> None:
+        self.repository.commit_baseline({"tracked.txt": "unchanged\n"})
+        self.repository.write(
+            "new-big.txt", "".join(f"fresh-{index:04d}\n" for index in range(400))
+        )
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertTrue(actual.startswith("diff --git "))
+        self.assertIn("omitted remainder: new-big.txt (", actual)
+        self.assertNotIn("fresh-0399", actual)
+
+
 class CommitHistoryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repository = GitRepository()

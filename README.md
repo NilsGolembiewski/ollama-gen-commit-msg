@@ -54,18 +54,29 @@ status.
 
 The index has absolute precedence:
 
-1. If any changes are staged, only `git diff --cached` is sent to the model.
+1. If any changes are staged, only `git diff --cached` is selected.
 2. If nothing is staged, tracked unstaged changes and all nonignored untracked
-   files are sent.
+   files are selected.
 
 Untracked files are rendered as Git patches without modifying the index. Ignored
-files are excluded. Large diffs are not truncated.
+files are excluded. Every changed path is still listed.
+
+Before the model sees the selected changes, bulky patches are compacted:
+
+- Dependency lockfiles such as `uv.lock` and `package-lock.json` are sent as
+  one-line omissions with insert/delete counts, not as patch bodies.
+- Other files over about 300 lines or 16 KiB are truncated to a header and
+  prefix, with a remainder count.
+- Combined change text is kept under about 32 KiB by omitting the largest
+  remaining full patches if needed.
+
+The command does not add exclude flags. Compaction is automatic and silent.
 
 The prompt has this exact structure:
 
 ```text
 <changes>
-...literal Git diff output
+...selected Git diff output, which may include omission lines
 </changes>
 
 Create a concise commit message that accurately summarizes these changes. Return only the commit message.
@@ -75,9 +86,10 @@ If the repository has no selected changes, the command exits before contacting
 Ollama.
 
 > [!WARNING]
-> The complete selected diff is sent to an Ollama cloud model. Review staged,
-> unstaged, and untracked files for credentials, tokens, personal data, or other
-> sensitive content before running the command.
+> Selected change text is sent to an Ollama cloud model. Lockfile bodies and
+> oversized patches are omitted or truncated, but remaining source diffs may
+> still contain credentials, tokens, personal data, or other sensitive content.
+> Review staged, unstaged, and untracked files before running the command.
 
 ## Development
 
