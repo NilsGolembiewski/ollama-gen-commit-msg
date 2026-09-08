@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,19 +50,28 @@ class GitCommandError(GitChangesError):
     """Raised when Git cannot produce change data."""
 
 
-class GitOutputError(GitChangesError):
-    """Raised when Git output cannot be represented in the model prompt."""
-
-
 class NoChangesError(GitChangesError):
     """Raised when the repository has no selected changes."""
 
 
-def _decode_output(output: bytes, description: str) -> str:
-    try:
-        return output.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise GitOutputError(f"{description} is not valid UTF-8.") from error
+def _decode_output(output: bytes) -> str:
+    """Decode Git stdout destined for the model prompt.
+
+    Git output (diff bodies, log subjects) is raw bytes and may contain byte
+    sequences that are not valid UTF-8, for example a Latin-1 encoded file in
+    the changeset. Invalid bytes become U+FFFD replacement characters instead
+    of aborting commit-message generation, and the result stays valid UTF-8.
+    """
+    return output.decode("utf-8", errors="replace")
+
+
+def _decode_path(output: bytes) -> str:
+    """Decode a path that will be passed to a follow-up Git command.
+
+    `os.fsdecode` uses surrogateescape, so bytes that are not valid UTF-8
+    round-trip exactly through `subprocess` instead of being replaced.
+    """
+    return os.fsdecode(output)
 
 
 def _error_detail(stderr: bytes) -> str:
@@ -87,7 +97,7 @@ def _repository_root(cwd: Path) -> Path:
     if result.returncode != 0:
         raise GitRepositoryError("Current directory is not inside a Git repository.")
 
-    root = _decode_output(result.stdout, "Git repository path").rstrip("\n")
+    root = _decode_path(result.stdout).rstrip("\n")
     if not root:
         raise GitRepositoryError("Git did not return a repository root.")
     return Path(root)
@@ -101,7 +111,7 @@ def _diff(arguments: Sequence[str], root: Path) -> str:
         if detail:
             message = f"{message} {detail}"
         raise GitCommandError(message)
-    return _decode_output(result.stdout, "Git diff output")
+    return _decode_output(result.stdout)
 
 
 def _untracked_paths(root: Path) -> list[str]:
@@ -116,8 +126,7 @@ def _untracked_paths(root: Path) -> list[str]:
             message = f"{message} {detail}"
         raise GitCommandError(message)
 
-    output = _decode_output(result.stdout, "Git untracked file list")
-    return [path for path in output.split("\0") if path]
+    return [_decode_path(path) for path in result.stdout.split(b"\0") if path]
 
 
 def _untracked_diff(relative_path: str, root: Path) -> str:
@@ -137,7 +146,7 @@ def _untracked_diff(relative_path: str, root: Path) -> str:
         result.returncode == 1 and bool(result.stdout) and not result.stderr
     )
     if result.returncode == 0 or valid_difference:
-        return _decode_output(result.stdout, "Git untracked file diff")
+        return _decode_output(result.stdout)
 
     detail = _error_detail(result.stderr)
     message = f"Git could not produce a diff for untracked file {relative_path!r}."
@@ -163,7 +172,7 @@ def recent_commits(cwd: str | Path | None = None, *, limit: int = 20) -> str:
         # Unborn branch (`HEAD` has no commits yet) or a corrupt reflog: no
         # history to mirror, so degrade to an empty section.
         return ""
-    return _decode_output(result.stdout, "Git log output").strip("\n")
+    return _decode_output(result.stdout).strip("\n")
 
 
 def branch_name(cwd: str | Path | None = None) -> str:
@@ -176,7 +185,7 @@ def branch_name(cwd: str | Path | None = None) -> str:
     result = _invoke_git(("rev-parse", "--abbrev-ref", "HEAD"), root)
     if result.returncode != 0:
         return ""
-    name = _decode_output(result.stdout, "Git branch name").strip()
+    name = _decode_output(result.stdout).strip()
     if not name or name == "HEAD":
         return ""
     return name
@@ -199,7 +208,7 @@ def branch_commits(
     if result.returncode != 0:
         # Missing base ref or unborn HEAD: no thread to anchor to.
         return ""
-    return _decode_output(result.stdout, "Git branch log output").strip("\n")
+    return _decode_output(result.stdout).strip("\n")
 
 
 def collect_changes(cwd: str | Path | None = None) -> str:

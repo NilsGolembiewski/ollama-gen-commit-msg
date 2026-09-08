@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -8,7 +9,6 @@ from unittest.mock import patch
 
 from gen_commit_msg.git_changes import (
     GitCommandError,
-    GitOutputError,
     GitRepositoryError,
     NoChangesError,
     branch_commits,
@@ -170,17 +170,28 @@ class GitChangeCollectionTests(unittest.TestCase):
             with self.assertRaises(GitCommandError):
                 collect_changes("/tmp/repository")
 
-    def test_non_utf8_diff_is_rejected_without_lossy_replacement(self) -> None:
-        completed_processes = [
-            subprocess.CompletedProcess([], 0, b"/tmp/repository\n", b""),
-            subprocess.CompletedProcess([], 0, b"diff\xff", b""),
-        ]
+    def test_non_utf8_diff_content_is_replaced_not_fatal(self) -> None:
+        self.repository.commit_baseline({"tracked.txt": "unchanged\n"})
+        (self.repository.path / "latin1.txt").write_bytes(b"caf\xe9 lat\xe9\n")
+        self.repository.run("add", "latin1.txt")
 
-        with patch(
-            "gen_commit_msg.git_changes._invoke_git", side_effect=completed_processes
-        ):
-            with self.assertRaisesRegex(GitOutputError, "not valid UTF-8"):
-                collect_changes("/tmp/repository")
+        actual = collect_changes(self.repository.path)
+
+        self.assertIn("latin1.txt", actual)
+        self.assertIn("caf\ufffd lat\ufffd\n", actual)
+        self.assertNotIn("caf\xe9", actual)
+        actual.encode("utf-8")  # prompt-safe: no surrogate escapes leaked
+
+    def test_non_utf8_untracked_filename_is_rendered(self) -> None:
+        self.repository.commit_baseline({"tracked.txt": "unchanged\n"})
+        raw_name = os.fsdecode(b"caf\xff.txt")
+        (self.repository.path / raw_name).write_bytes(b"payload\n")
+
+        actual = collect_changes(self.repository.path)
+
+        self.assertIn("payload", actual)
+        encoded = actual.encode("utf-8")  # prompt-safe: no surrogate escapes
+        self.assertIn(b'"a/caf\\377.txt"', encoded)
 
     def _expected_fallback_diff(self) -> str:
         chunks = [
