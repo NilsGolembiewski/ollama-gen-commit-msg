@@ -4,9 +4,11 @@ import io
 import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from gen_commit_msg.cli import main
+import httpx
+
+from gen_commit_msg.cli import DEFAULT_PROXY_ORIGIN, main
 from gen_commit_msg.generator import (
     CommitContext,
     GenerationError,
@@ -20,7 +22,11 @@ from gen_commit_msg.git_changes import (
 
 
 class CliTests(unittest.TestCase):
-    @patch.dict(os.environ, {"OLLAMA_HOST": "http://localhost:11434"}, clear=True)
+    @patch.dict(
+        os.environ,
+        {"GENERIC_OPENAI_PROXY_HOST": "http://proxy.internal:4119"},
+        clear=True,
+    )
     @patch("gen_commit_msg.cli.recent_commits", return_value="feat: prior change")
     @patch("gen_commit_msg.cli.branch_name", return_value="feature/123")
     @patch("gen_commit_msg.cli.branch_commits", return_value="wip: in progress")
@@ -46,7 +52,7 @@ class CliTests(unittest.TestCase):
         collect_changes.assert_called_once()
         generate_message.assert_called_once_with(
             "literal diff\n",
-            "http://localhost:11434",
+            "http://proxy.internal:4119",
             context=CommitContext(
                 recent_commits="feat: prior change",
                 branch_name="feature/123",
@@ -73,62 +79,81 @@ class CliTests(unittest.TestCase):
         collect_changes.assert_not_called()
         generate_message.assert_not_called()
 
-    @patch("gen_commit_msg.cli.collect_changes")
-    @patch("gen_commit_msg.cli.generate_message")
-    def test_missing_or_blank_host_is_rejected(
+    @patch("gen_commit_msg.cli.collect_changes", return_value="diff\n")
+    @patch("gen_commit_msg.cli.generate_message", return_value="feat: change")
+    def test_unset_or_blank_proxy_origin_uses_local_default(
         self, generate_message, collect_changes
     ) -> None:
-        for environment in ({}, {"OLLAMA_HOST": "   "}):
+        environments = (
+            {},
+            {"GENERIC_OPENAI_PROXY_HOST": ""},
+            {"GENERIC_OPENAI_PROXY_HOST": "   "},
+        )
+        for environment in environments:
             with self.subTest(environment=environment):
-                stderr = io.StringIO()
-                with patch.dict(os.environ, environment, clear=True), redirect_stderr(
-                    stderr
-                ):
+                generate_message.reset_mock()
+                with patch.dict(
+                    os.environ, environment, clear=True
+                ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     status = main([])
 
-                self.assertEqual(status, 1)
-                self.assertIn("OLLAMA_HOST", stderr.getvalue())
-        collect_changes.assert_not_called()
-        generate_message.assert_not_called()
+                self.assertEqual(status, 0)
+                self.assertEqual(
+                    generate_message.call_args.args[1], "http://localhost:4119"
+                )
+
+        self.assertEqual(DEFAULT_PROXY_ORIGIN, "http://localhost:4119")
 
     @patch("gen_commit_msg.cli.collect_changes")
     @patch("gen_commit_msg.cli.generate_message")
-    def test_direct_cloud_host_is_rejected(
+    def test_invalid_proxy_origins_are_rejected(
         self, generate_message, collect_changes
     ) -> None:
-        for host in ("https://ollama.com", "https://ollama.com/api"):
-            with self.subTest(host=host):
+        cases = {
+            "localhost:4119": "absolute",
+            "ftp://localhost:4119": "absolute",
+            "http://localhost:4119/api": "origin only",
+            "http://localhost:4119?x=1": "origin only",
+            "http://localhost:4119#frag": "origin only",
+            "http://user:secret@localhost:4119": "credentials",
+            "http://[": "valid URL",
+            "http://localhost:99999": "valid URL",
+            "http://local host:4119": "whitespace",
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
                 stderr = io.StringIO()
                 with patch.dict(
-                    os.environ, {"OLLAMA_HOST": host}, clear=True
+                    os.environ, {"GENERIC_OPENAI_PROXY_HOST": value}, clear=True
                 ), redirect_stderr(stderr):
                     status = main([])
 
                 self.assertEqual(status, 1)
-                self.assertIn("local Ollama server", stderr.getvalue())
+                self.assertIn("GENERIC_OPENAI_PROXY_HOST", stderr.getvalue())
+                self.assertIn(expected, stderr.getvalue())
+                self.assertNotIn("secret", stderr.getvalue())
         collect_changes.assert_not_called()
         generate_message.assert_not_called()
 
-    @patch("gen_commit_msg.cli.collect_changes")
-    @patch("gen_commit_msg.cli.generate_message")
-    def test_malformed_host_is_rejected_without_traceback(
+    @patch("gen_commit_msg.cli.collect_changes", return_value="diff\n")
+    @patch("gen_commit_msg.cli.generate_message", return_value="feat: change")
+    def test_trailing_slash_is_normalized(
         self, generate_message, collect_changes
     ) -> None:
-        stderr = io.StringIO()
         with patch.dict(
-            os.environ, {"OLLAMA_HOST": "http://["}, clear=True
-        ), redirect_stderr(stderr):
+            os.environ,
+            {"GENERIC_OPENAI_PROXY_HOST": "http://localhost:4119/"},
+            clear=True,
+        ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             status = main([])
 
-        self.assertEqual(status, 1)
-        self.assertIn("OLLAMA_HOST", stderr.getvalue())
-        collect_changes.assert_not_called()
-        generate_message.assert_not_called()
+        self.assertEqual(status, 0)
+        self.assertEqual(generate_message.call_args.args[1], "http://localhost:4119")
 
-    @patch.dict(os.environ, {"OLLAMA_HOST": "http://localhost:11434"}, clear=True)
+    @patch.dict(os.environ, {}, clear=True)
     @patch("gen_commit_msg.cli.generate_message")
     @patch("gen_commit_msg.cli.collect_changes")
-    def test_git_failures_do_not_call_ollama(
+    def test_git_failures_do_not_call_the_proxy(
         self, collect_changes, generate_message
     ) -> None:
         failures = (
@@ -153,10 +178,10 @@ class CliTests(unittest.TestCase):
                 self.assertIn(str(failure), stderr.getvalue())
                 generate_message.assert_not_called()
 
-    @patch.dict(os.environ, {"OLLAMA_HOST": "http://localhost:11434"}, clear=True)
+    @patch.dict(os.environ, {}, clear=True)
     @patch(
         "gen_commit_msg.cli.generate_message",
-        side_effect=GenerationError("Ollama could not generate a commit message."),
+        side_effect=GenerationError("The proxy could not generate a commit message."),
     )
     @patch("gen_commit_msg.cli.collect_changes", return_value="diff\n")
     def test_generation_failure_is_reported_without_traceback(
@@ -171,24 +196,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(
-            stderr.getvalue(), "error: Ollama could not generate a commit message.\n"
+            stderr.getvalue(),
+            "error: The proxy could not generate a commit message.\n",
         )
         self.assertNotIn("Traceback", stderr.getvalue())
 
-    @patch.dict(os.environ, {"OLLAMA_HOST": "http://localhost:11434"}, clear=True)
+    @patch.dict(os.environ, {}, clear=True)
     @patch("gen_commit_msg.cli.collect_changes", return_value="diff\n")
     def test_missing_model_response_is_reported_without_traceback(
         self, collect_changes
     ) -> None:
-        client = Mock()
-        client.generate.return_value = Mock(response=None)
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": None}}
+                    ]
+                },
+                request=request,
+            )
 
-        def generate_missing_response(changes: str, host: str, context=None) -> str:
+        def generate_missing_response(changes: str, origin: str, context=None) -> str:
             return generate(
                 changes,
-                host,
+                origin,
                 context=context,
-                client_factory=Mock(return_value=client),
+                transport=httpx.MockTransport(handler),
             )
 
         stdout = io.StringIO()
@@ -204,7 +238,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("empty commit message", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
-    @patch.dict(os.environ, {"OLLAMA_HOST": "http://localhost:11434"}, clear=True)
+    @patch.dict(os.environ, {}, clear=True)
     @patch("gen_commit_msg.cli.generate_message", return_value="  Add feature  \n")
     @patch("gen_commit_msg.cli.collect_changes", return_value="diff\n")
     def test_success_trims_only_outer_message_whitespace(

@@ -1,7 +1,7 @@
 # gen-commit-msg
 
-Generate a concise commit message from the current Git changes with Ollama Cloud's
-`glm-5.3-flash:cloud` model.
+Generate a concise commit message from the current Git changes through the
+Generic OpenAI Proxy using the `openrouter/z-ai/glm-5.3-flash` model.
 
 The command prints a commit-message suggestion. It does not stage files, create a
 commit, or modify the repository.
@@ -10,15 +10,12 @@ commit, or modify the repository.
 
 - Python 3.11 or newer
 - Git available on `PATH`
-- A local Ollama server with an Ollama account
+- A running Generic OpenAI Proxy with an upstream provider connection configured
 - [uv](https://docs.astral.sh/uv/) for installation or development
 
-Sign the local Ollama installation in and make the cloud model available:
-
-```bash
-ollama signin
-ollama pull glm-5.3-flash:cloud
-```
+This tool holds no provider credential. The proxy keeps named upstream
+connections and their API keys server-side and exposes a flattened
+OpenAI-compatible API on `<origin>/openai/v1`.
 
 ## Install
 
@@ -28,15 +25,22 @@ From this repository, install the command as an isolated uv tool:
 uv tool install .
 ```
 
-Set `OLLAMA_HOST` to the local Ollama server that will route cloud-model requests:
+Point the tool at the proxy origin:
 
 ```bash
-export OLLAMA_HOST=http://localhost:11434
+export GENERIC_OPENAI_PROXY_HOST=http://localhost:4119
 ```
 
-The direct cloud API host `https://ollama.com` is intentionally rejected. This
-tool uses the `glm-5.3-flash:cloud` model through a signed-in local Ollama server and
-does not implement direct `OLLAMA_API_KEY` mode.
+`GENERIC_OPENAI_PROXY_HOST` must be an absolute `http` or `https` origin with no
+path, query, fragment, or embedded credentials. A single trailing slash is
+accepted. When the variable is unset or blank, the command falls back to
+`http://localhost:4119`; a non-blank value that is not a valid origin is rejected
+instead of being silently replaced.
+
+The model is a fixed constant, `openrouter/z-ai/glm-5.3-flash`. The proxy routes
+the `<provider-alias>/<upstream-model-id>` form, so only the first `/` separates
+the alias from the upstream model. No proxy authorization header is sent,
+because the proxy is an unauthenticated local intermediary.
 
 ## Usage
 
@@ -82,14 +86,23 @@ The prompt has this exact structure:
 Create a concise commit message that accurately summarizes these changes. Return only the commit message.
 ```
 
+When recent commit subjects, the current branch, or branch commits are
+available, they are inserted before the `<changes>` block as style and thread
+context.
+
 If the repository has no selected changes, the command exits before contacting
-Ollama.
+the proxy.
 
 > [!WARNING]
-> Selected change text is sent to an Ollama cloud model. Lockfile bodies and
-> oversized patches are omitted or truncated, but remaining source diffs may
-> still contain credentials, tokens, personal data, or other sensitive content.
-> Review staged, unstaged, and untracked files before running the command.
+> Selected change text is sent through the proxy to the configured upstream
+> provider. Lockfile bodies and oversized patches are omitted or truncated, but
+> remaining source diffs may still contain credentials, tokens, personal data,
+> or other sensitive content. Review staged, unstaged, and untracked files
+> before running the command.
+>
+> The default proxy listener is loopback-only and unauthenticated, so any process
+> on the machine can use its configured accounts. Keep the proxy bound to
+> loopback and keep real API keys in the proxy's server-side configuration.
 
 ## Development
 
@@ -106,8 +119,8 @@ uv run python -m unittest discover -s tests -v
 uv build
 ```
 
-Automated tests use temporary Git repositories and fake Ollama clients; they do
-not require an account or consume cloud capacity.
+Automated tests use temporary Git repositories and mocked proxy HTTP transports;
+they do not require a running proxy or consume upstream capacity.
 
 ## Uninstall
 

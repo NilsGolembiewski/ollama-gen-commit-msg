@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from ollama import Client, ResponseError
 
 
-MODEL = "glm-5.3-flash:cloud"
+# The proxy routes "<alias>/<upstream-model-id>" to the configured provider.
+MODEL = "openrouter/z-ai/glm-5.3-flash"
+CHAT_COMPLETIONS_PATH = "/openai/v1/chat/completions"
+REQUEST_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 INSTRUCTION = (
     "Create a concise commit message that accurately summarizes these changes. "
     "Return only the commit message."
@@ -27,7 +29,7 @@ class CommitContext:
 
 
 class GenerationError(Exception):
-    """Raised when Ollama cannot generate a usable commit message."""
+    """Raised when the proxy cannot produce a usable commit message."""
 
 
 def build_prompt(changes: str, context: CommitContext | None = None) -> str:
@@ -56,32 +58,96 @@ def _context_sections(context: CommitContext) -> list[str]:
     return sections
 
 
+def _endpoint(origin: str) -> str:
+    return origin.rstrip("/") + CHAT_COMPLETIONS_PATH
+
+
+def _payload(prompt: str) -> dict[str, Any]:
+    return {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+
+
 def generate_message(
     changes: str,
-    host: str,
+    origin: str,
     *,
     context: CommitContext | None = None,
-    client_factory: Callable[..., Any] = Client,
+    transport: httpx.BaseTransport | None = None,
 ) -> str:
-    try:
-        client = client_factory(host=host)
-        response = client.generate(
-            model=MODEL,
-            prompt=build_prompt(changes, context),
-            stream=False,
-        )
-    except ResponseError as error:
-        raise GenerationError(
-            "Ollama rejected the generation request. Ensure glm-5.3-flash:cloud is "
-            "available and the local Ollama server is signed in."
-        ) from error
-    except (ConnectionError, httpx.HTTPError, httpx.InvalidURL, ValueError) as error:
-        raise GenerationError(
-            "Ollama could not generate a commit message. Check OLLAMA_HOST and "
-            "the local Ollama server."
-        ) from error
+    prompt = build_prompt(changes, context)
+    endpoint = _endpoint(origin)
 
-    response_text = response.response
-    if not isinstance(response_text, str) or not response_text.strip():
-        raise GenerationError("Ollama returned an empty commit message.")
-    return response_text.strip()
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT, transport=transport) as client:
+            response = client.post(endpoint, json=_payload(prompt))
+    except (httpx.InvalidURL, httpx.HTTPError) as error:
+        raise GenerationError(_transport_failure(endpoint, error)) from error
+
+    _raise_for_error_status(response)
+    return _message_text(response)
+
+
+def _transport_failure(endpoint: str, error: Exception) -> str:
+    if isinstance(error, httpx.TimeoutException):
+        problem = "timed out"
+    else:
+        problem = "could not be reached"
+    return (
+        f"The Generic OpenAI Proxy request to {endpoint} {problem}. Check "
+        "GENERIC_OPENAI_PROXY_HOST and that the proxy is running."
+    )
+
+
+def _raise_for_error_status(response: httpx.Response) -> None:
+    status = response.status_code
+    if 200 <= status < 300:
+        return
+    if status == 400:
+        detail = (
+            "the request was rejected; the model must be provider-qualified, "
+            f"for example {MODEL}"
+        )
+    elif status == 404:
+        detail = "the proxy does not recognize this provider alias or path"
+    elif status in (401, 403):
+        detail = "the proxy or the upstream provider rejected its credentials"
+    elif status == 429:
+        detail = "the upstream provider rate limit or quota was reached"
+    elif status in (502, 503, 504):
+        detail = "the proxy could not reach the upstream provider or timed out"
+    else:
+        detail = "the proxy reported an unexpected failure"
+    raise GenerationError(
+        f"Commit message generation failed (HTTP {status}): {detail}."
+    )
+
+
+def _message_text(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise GenerationError(
+            "The Generic OpenAI Proxy returned a response that is not JSON."
+        ) from error
+    if not isinstance(payload, Mapping):
+        raise GenerationError(
+            "The Generic OpenAI Proxy returned an unrecognized response."
+        )
+
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise GenerationError(
+            "The Generic OpenAI Proxy returned no completion choices."
+        )
+
+    choice = choices[0]
+    message = choice.get("message") if isinstance(choice, Mapping) else None
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if not isinstance(content, str) or not content.strip():
+        raise GenerationError(
+            "The Generic OpenAI Proxy returned an empty commit message."
+        )
+    return content.strip()
